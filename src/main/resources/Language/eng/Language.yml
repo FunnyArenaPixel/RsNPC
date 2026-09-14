@@ -1,4 +1,4 @@
-plugin.depend.gamecore.needReload: "MemoriesOfTime-GameCore Dependency download complete! It is strongly recommended to restart the server to ensure proper loading!"
+plugin.depend.gamecore.needReload: "MemoriesOfTime-GameCore dependency downloaded! MUST RESTART THE SERVER AGAIN! Until restart, NPC dialog clicks will throw NoClassDefFoundError (recover after restart). 必须再重启一次服务器，重启前NPC对话会报错！"
 plugin.depend.autoupdata.error: "Plugin auto update failed! Please check the AutoUpData plugin!"
 
 plugin.load.startLoad: "RsNPC start loading"
