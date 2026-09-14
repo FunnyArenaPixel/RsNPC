@@ -5,6 +5,7 @@ import cn.lanink.gamecore.utils.NukkitTypeUtils;
 import cn.lanink.gamecore.utils.packet.ProtocolVersion;
 import cn.nukkit.Player;
 import cn.nukkit.Server;
+import cn.nukkit.block.Block;
 import cn.nukkit.block.BlockLiquid;
 import cn.nukkit.entity.EntityHuman;
 import cn.nukkit.entity.data.EntityMetadata;
@@ -23,8 +24,12 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 
+import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class EntityRsNPC extends EntityHuman {
 
@@ -44,6 +49,13 @@ public class EntityRsNPC extends EntityHuman {
     private RouteFinder nowRouteFinder;
     @Setter
     private int pauseMoveTick = 0;
+
+    // ---- v2.5.3: NPC头顶显示按玩家设置裁剪(与 NsGameBase 大厅浮空字共用 lobby.ft.* 键) ----
+    /** 玩家名 -> nametag 是否应对其隐藏;仅用于周期重估时的状态翻转检测 */
+    private final Map<String, Boolean> nameTagHidden = new ConcurrentHashMap<>();
+    /** 反射缓存: cn.nsgamebase.api.GbPlayerDataApi#look(String, String);失败后不再重试 */
+    private static Method NSGB_LOOK;
+    private static boolean NSGB_LOOKUP_FAILED;
 
     /**
      * RsNPC实体在创建时必须传入RsNPCConfig参数，保留此方法仅为兼容核心创建实体方法
@@ -121,6 +133,11 @@ public class EntityRsNPC extends EntityHuman {
         if (this.config == null) {
             this.close();
             return false;
+        }
+
+        // v2.5.3: 每10tick(0.5秒)重估各玩家 nametag 可见性(距离+遮挡),状态翻转才重发包
+        if (currentTick % 10 == 0 && !this.getViewers().isEmpty()) {
+            this.updateNameTagVisibility();
         }
 
         //旋转
@@ -325,27 +342,134 @@ public class EntityRsNPC extends EntityHuman {
     public void sendData(Player player, EntityMetadata data) {
         SetEntityDataPacket pk = new SetEntityDataPacket();
         pk.eid = this.getId();
-        pk.metadata = data == null ? this.dataProperties : data;
+        // 每玩家发快照,绝不回写共享 dataProperties:
+        // hidden 玩家会写空 nametag,checkEntity 每 60tick setNameTag 又写回,
+        // 共享值在 空/真名 间振荡 → 新进入玩家 spawn 时交替看到无名 NPC
+        pk.metadata = (data == null ? this.dataProperties : data).clone();
         pk.metadata.putString(
                 EntityUtils.getEntityField("DATA_NAMETAG", DATA_NAMETAG),
-                VariableManage.stringReplace(player, this.getNameTag(), this.getConfig())
+                this.isNameTagHiddenFor(player)
+                        ? ""
+                        : VariableManage.stringReplace(player, this.getNameTag(), this.getConfig())
         );
         player.dataPacket(pk);
     }
 
     @Override
     public void sendData(Player[] players, EntityMetadata data) {
-        SetEntityDataPacket pk = new SetEntityDataPacket();
-        pk.eid = this.getId();
-        pk.metadata = data == null ? this.dataProperties : data;
-
-        for(Player player : players) {
-            SetEntityDataPacket clone = (SetEntityDataPacket) pk.clone();
-            clone.metadata.putString(
+        EntityMetadata base = (data == null ? this.dataProperties : data).clone();
+        for (Player player : players) {
+            SetEntityDataPacket pk = new SetEntityDataPacket();
+            pk.eid = this.getId();
+            pk.metadata = base.clone();
+            pk.metadata.putString(
                     EntityUtils.getEntityField("DATA_NAMETAG", DATA_NAMETAG),
-                    VariableManage.stringReplace(player, this.getNameTag(), this.getConfig())
+                    this.isNameTagHiddenFor(player)
+                            ? ""
+                            : VariableManage.stringReplace(player, this.getNameTag(), this.getConfig())
             );
-            player.dataPacket(clone);
+            player.dataPacket(pk);
+        }
+    }
+
+    // ================================================================
+    //  v2.5.3 nametag 可见性裁剪:与 NsGameBase 大厅浮空字同款规则
+    //  (超距隐藏+视线被实心非透明方块遮挡隐藏,玩家可在主菜单"我的设置-性能"调整;
+    //  NsGameBase 未安装或 API 不可用时按默认 24 格/启用遮挡判定)
+    // ================================================================
+
+    /** 周期重估:可见性状态翻转的玩家才重发 nametag 数据包,同时清理已离开视距的缓存 */
+    private void updateNameTagVisibility() {
+        for (Player player : new ArrayList<>(this.getViewers().values())) {
+            boolean hidden = this.computeNameTagHidden(player);
+            Boolean old = this.nameTagHidden.put(player.getName(), hidden);
+            if (old == null || old != hidden) {
+                this.sendData(player);
+            }
+        }
+        this.nameTagHidden.keySet().removeIf(name -> {
+            for (Player p : this.getViewers().values()) {
+                if (p.getName().equals(name)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    /** 该玩家的 nametag 是否应隐藏(实时计算;sendData 发包前都会经过这里) */
+    private boolean isNameTagHiddenFor(Player player) {
+        return this.computeNameTagHidden(player);
+    }
+
+    /** 不同世界=隐藏;距离超限(可关)=隐藏;遮挡检测默认关闭(lobby.ft.occl 1=启用) */
+    private boolean computeNameTagHidden(Player player) {
+        if (player.getLevel() != this.getLevel()) {
+            return true;
+        }
+        String name = player.getName();
+        if (lookupNsgb(name, "lobby.ft.dist.off") != 1) {
+            int cfg = lookupNsgb(name, "lobby.ft.dist");
+            double dist = cfg > 0 ? cfg : DEFAULT_VISIBILITY_DISTANCE;
+            if (player.distanceSquared(this) > dist * dist) {
+                return true;
+            }
+        }
+        if (lookupNsgb(name, "lobby.ft.occl") == 1) {
+            return !this.hasLineOfSight(player);
+        }
+        return false;
+    }
+
+    private static final double DEFAULT_VISIBILITY_DISTANCE = 24.0;
+    /** 视线采样步长(格),与 NsGameBase 浮空字/起床战争实现一致 */
+    private static final double OCCLUSION_STEP = 0.5;
+
+    /**
+     * 视线检查:玩家眼睛 -> NPC 头顶,0.5格步进采样;
+     * 实心且不透明的方块视为遮挡(玻璃等透明方块不算),端点本身不参与判定。
+     */
+    private boolean hasLineOfSight(Player player) {
+        Vector3 from = new Vector3(player.x, player.y + player.getEyeHeight(), player.z);
+        Vector3 to = new Vector3(this.x, this.y + this.getEyeHeight(), this.z);
+        double dx = to.x - from.x;
+        double dy = to.y - from.y;
+        double dz = to.z - from.z;
+        double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (distance < OCCLUSION_STEP) {
+            return true;
+        }
+        double steps = Math.ceil(distance / OCCLUSION_STEP);
+        double stepX = dx / steps;
+        double stepY = dy / steps;
+        double stepZ = dz / steps;
+        for (int i = 1; i < steps; i++) {
+            int id = this.getLevel().getBlockIdAt(
+                    (int) Math.floor(from.x + stepX * i),
+                    (int) Math.floor(from.y + stepY * i),
+                    (int) Math.floor(from.z + stepZ * i));
+            if (id != Block.AIR && Block.isBlockSolidById(id) && !Block.isBlockTransparentById(id)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 反射读取 NsGameBase 玩家变量(lobby.ft.*);未安装/异常返回 0(=默认全启用) */
+    private static int lookupNsgb(String name, String key) {
+        if (NSGB_LOOKUP_FAILED) {
+            return 0;
+        }
+        try {
+            if (NSGB_LOOK == null) {
+                Class<?> cls = Class.forName("cn.nsgamebase.api.GbPlayerDataApi");
+                NSGB_LOOK = cls.getMethod("look", String.class, String.class);
+            }
+            Object r = NSGB_LOOK.invoke(null, name, key);
+            return r instanceof Number ? ((Number) r).intValue() : 0;
+        } catch (Throwable t) {
+            NSGB_LOOKUP_FAILED = true;
+            return 0;
         }
     }
 
